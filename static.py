@@ -3,6 +3,8 @@
 import argparse
 import hashlib
 import json
+from re import template
+import mistletoe
 import os
 import sys
 
@@ -68,16 +70,25 @@ def create() -> None:
                     "templates": "",
                     "posts": "",
                 }
-    meta = {"base": base_templates, "templates": {}, "posts": {}, "assets": {}}
+    no_output = {
+                "templates": [],
+                "posts": [],
+                "assets": [],
+    }
+    meta = {"base": base_templates, "no_output": no_output,
+            "templates": {}, "posts": {}, "assets": {}}
     with open('meta.json', 'w') as f:
         json.dump(meta, f, indent=4)
     print("Done!")
 
 
 def get_changes(meta: Dict, force_recompile: bool = False) -> Dict:
-    def file_changed(path: str, file_past: Dict) -> bool:
+    def file_changed(path: str, file_past: Dict) -> bool | Dict:
         if not os.path.isfile(path):
             return False
+
+        if not file_past:
+            return True
 
         curr_mod_date = os.path.getmtime(path)
         if file_past["mod_date"] < curr_mod_date:
@@ -123,13 +134,12 @@ def get_changes(meta: Dict, force_recompile: bool = False) -> Dict:
     all_changes = {}
 
     base_template = meta["base"]["templates"]
-    templates_force_recompile = force_recompile or (base_template != "" and file_changed(os.path.join(FOLDERS["templates"], base_template),
-                                meta["templates"][base_template]))
+    templates_force_recompile = force_recompile or file_changed(os.path.join(FOLDERS["templates"], base_template),
+                                meta["templates"][base_template] if base_template in meta["templates"] else {})
     all_changes["templates"] = folder_changes("templates", ".html", templates_force_recompile)
 
     posts_template = meta["base"]["posts"]
-    posts_force_recompile = templates_force_recompile or (posts_template != "" and file_changed(os.path.join(FOLDERS["templates"], posts_template),
-                            meta["templates"][posts_template]))
+    posts_force_recompile = templates_force_recompile or posts_template in all_changes["templates"][0]
     all_changes["posts"] = folder_changes("posts", ".md", posts_force_recompile)
 
     all_changes["assets"] = folder_changes("assets")
@@ -164,7 +174,7 @@ def generate(incremental: bool=True):
         copy(src, dest)
 
     def templates_mod_handler(name: str):
-        if hasattr(meta["templates"][name], "no_compile"):
+        if name in meta["no_output"]["templates"]:
             return
 
         print(f"Rendering 'site\\{name}'...")
@@ -192,6 +202,9 @@ def generate(incremental: bool=True):
                 os.rmdir(dir_path)
 
     def static_mod_handler(name: str):
+        if name in meta["no_output"]["assets"]:
+            return
+
         print(f"Copying '{name}' from 'assets\\' to 'site\\'")
         src = os.path.join(FOLDERS["assets"], name)
         copy_with_dirs(src, name)
@@ -200,26 +213,25 @@ def generate(incremental: bool=True):
         return path
 
 
-    env = Environment(
-            loader=FileSystemLoader(searchpath=["templates"]),
-            autoescape=select_autoescape()
-        )
-
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
         meta = json.load(f)
 
     print("\nDetecting changed files...")
 
     changes = get_changes(meta, not incremental)
-
     if incremental and len(changes["assets"][0]) == 0 and len(changes["assets"][1]) == 0 \
         and len(changes["templates"][0]) == 0 and len(changes["templates"][1]) == 0 \
         and len(changes["posts"][0]) == 0 and len(changes["posts"][1]) == 0:
         print("No changes!")
         return
 
+    env = Environment(
+            loader=FileSystemLoader(searchpath=["templates"]),
+            autoescape=select_autoescape()
+        )
     process_folder_changes(meta["templates"], changes["templates"], templates_mod_handler,
                            del_handler, incremental)
+
     process_folder_changes(meta["assets"], changes["assets"], static_mod_handler,
                            del_handler, incremental)
 
@@ -250,7 +262,7 @@ def run():
     class DevServer(BaseHTTPRequestHandler):
         def do_GET(self):
             requested = self.path[1:]
-            requested_no_ext = os.path.splitext(requested)[0]
+            requested_no_ext, ext = os.path.splitext(requested)
 
             if os.path.isfile(os.path.join(FOLDERS["assets"], requested)):
                 no_cache = ["js", "style"]
@@ -260,16 +272,21 @@ def run():
                     self.send_header('Cache-Control', 'public, max-age=15552000')
                 self.end_headers()
                 self.wfile.write(open(os.path.join(FOLDERS["assets"], requested),'rb').read())
-            elif os.path.isfile(os.path.join(FOLDERS["posts"], requested_no_ext + ".md")):
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(bytes("<h1> Trying to access post </h1>", "utf-8"))
-            elif os.path.isfile(os.path.join(FOLDERS["templates"], requested_no_ext + ".html")):
-                self.send_response(200)
-                self.end_headers()
-                template = env.get_template((requested_no_ext + ".html").replace('\\', '/'))
-                template.globals.update({'static': static})
-                self.wfile.write(bytes(template.render(), "utf-8"))
+            elif ext in ['', '.html']:
+                if os.path.isfile(os.path.join(FOLDERS["posts"], requested_no_ext + ".md")):
+                    requested = requested_no_ext + ".md"
+                    self.send_response(200)
+                    self.end_headers()
+                    with open(os.path.join(FOLDERS["posts"], requested)) as post:
+                        rendered_md = mistletoe.markdown(post)
+                        self.wfile.write(bytes(rendered_md, "utf-8"))
+                elif os.path.isfile(os.path.join(FOLDERS["templates"], requested_no_ext + ".html")):
+                    requested = requested_no_ext + ".html"
+                    self.send_response(200)
+                    self.end_headers()
+                    template = env.get_template((requested).replace('\\', '/'))
+                    template.globals.update({'static': static})
+                    self.wfile.write(bytes(template.render(), "utf-8"))
             else:
                 self.send_response(404)
                 self.end_headers()
