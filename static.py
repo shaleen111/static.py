@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import sys
-import threading
 
 from shutil import copy
 from itertools import zip_longest
@@ -29,12 +28,11 @@ COLORS = {
 
 BASE_DIR = os.getcwd()
 FOLDERS = {
-    "templates": os.path.join(BASE_DIR, "templates"), 
+    "templates": os.path.join(BASE_DIR, "templates"),
     "posts": os.path.join(BASE_DIR, "posts"),
     "assets": os.path.join(BASE_DIR, "assets"),
     "site": os.path.join(BASE_DIR, "site"),
 }
-
 
 
 def get_args() -> Tuple:
@@ -44,7 +42,7 @@ def get_args() -> Tuple:
     parser = argparse.ArgumentParser()
     parser.add_argument('command',
             choices=['create', 'generate', 'run', 'diff'])
-    
+
     arg = parser.parse_args()
     return arg.command
 
@@ -58,14 +56,14 @@ def create() -> None:
         try:
             os.mkdir(folder)
         except FileExistsError as err:
-            print(err) 
+            print(err)
             print("Undoing changes...")
             for f in FOLDERS.values():
                 if folder == f:
                     break
                 os.rmdir(f)
-
             sys.exit(1)
+
     base_templates = {
                     "templates": "",
                     "posts": "",
@@ -76,17 +74,21 @@ def create() -> None:
     print("Done!")
 
 
-def get_changes(meta: Dict) -> Dict:
-    def file_changed(path: str) -> bool:
+def get_changes(meta: Dict, force_recompile: bool = False) -> Dict:
+    def file_changed(path: str, file_past: Dict) -> bool:
         if not os.path.isfile(path):
             return False
 
-
+        curr_mod_date = os.path.getmtime(path)
+        if file_past["mod_date"] < curr_mod_date:
+            curr_hash = hashlib.md5(open(path, 'rb').read()).hexdigest()
+            if file_past["hash"] != curr_hash:
+                return True
 
         return False
 
-    def folder_changes(name: str, ext: str="", force_recompile: bool=False) -> Tuple[Dict, Set]:
-        def populate_changes(path_: str=FOLDERS[name], dir_chain: str=""): 
+    def folder_changes(name: str, ext: str="", _force_recompile: bool=False) -> Tuple[Dict, Set]:
+        def populate_changes(path_: str=FOLDERS[name], dir_chain: str=""):
             for file in os.scandir(path_):
                 if file.is_dir():
                     populate_changes(file.path, file.name)
@@ -95,7 +97,7 @@ def get_changes(meta: Dict) -> Dict:
                     name = os.path.join(dir_chain, file.name)
 
                     new_file = name not in past_set
-                    
+
                     curr_mod_date = file.stat().st_mtime
                     if new_file or past[name]["mod_date"] < curr_mod_date:
                         curr_hash = hashlib.md5(open(file.path, 'rb').read()).hexdigest()
@@ -106,8 +108,8 @@ def get_changes(meta: Dict) -> Dict:
                                     }
                     if not new_file:
                         past_set.remove(name)
-        
-        if force_recompile:
+
+        if _force_recompile:
             past_set = set()
         else:
             past = meta[name]
@@ -119,33 +121,34 @@ def get_changes(meta: Dict) -> Dict:
         return (changes, past_set)
 
     all_changes = {}
-    
-    base_changed = file_changed(os.path.join(BASE_DIR, meta["base"]["templates"]))
-    all_changes["templates"] = folder_changes("templates", ".html", base_changed)
 
-    all_changes["posts"] = folder_changes("posts", ".md", base_changed or 
-                                file_changed(os.path.join(BASE_DIR, meta["base"]["posts"])))
-    
+    base_template = meta["base"]["templates"]
+    templates_force_recompile = force_recompile or (base_template != "" and file_changed(os.path.join(FOLDERS["templates"], base_template),
+                                meta["templates"][base_template]))
+    all_changes["templates"] = folder_changes("templates", ".html", templates_force_recompile)
+
+    posts_template = meta["base"]["posts"]
+    posts_force_recompile = templates_force_recompile or (posts_template != "" and file_changed(os.path.join(FOLDERS["templates"], posts_template),
+                            meta["templates"][posts_template]))
+    all_changes["posts"] = folder_changes("posts", ".md", posts_force_recompile)
+
     all_changes["assets"] = folder_changes("assets")
 
     return all_changes
 
 
-def process_folder_changes(past: Dict, changes: Tuple, 
-        mod_handler: Callable[[str], None], del_handler: Callable[[str], None], 
+def process_folder_changes(past: Dict, changes: Tuple,
+        mod_handler: Callable[[str], None], del_handler: Callable[[str], None],
         save_changes: Optional[bool]=None,) -> None:
-    for (changed_file, deleted_file) in zip_longest(changes[0].items(), 
-                                            changes[1]):
-        if changed_file:
-            (name, metadata) = changed_file
-            if save_changes:
-                past[name] = metadata
-            mod_handler(name)
-
-        if deleted_file:
-            if save_changes:
-                past.pop(deleted_file)
-            del_handler(deleted_file)
+    for changed_file in changes[0].items():
+        (name, metadata) = changed_file
+        if save_changes:
+            past[name] = metadata
+        mod_handler(name)
+    for deleted_file in changes[1]:
+        if save_changes:
+            past.pop(deleted_file)
+        del_handler(deleted_file)
 
 
 def generate(incremental: bool=True):
@@ -161,11 +164,14 @@ def generate(incremental: bool=True):
         copy(src, dest)
 
     def templates_mod_handler(name: str):
+        if hasattr(meta["templates"][name], "no_compile"):
+            return
+
         print(f"Rendering 'site\\{name}'...")
         template = env.get_template(name.replace("\\", "/"))
         template.globals.update({"static": static})
         output = template.render()
-        
+
         src = os.path.join(FOLDERS["templates"], name)
         copy_with_dirs(src, name)
 
@@ -187,7 +193,6 @@ def generate(incremental: bool=True):
 
     def static_mod_handler(name: str):
         print(f"Copying '{name}' from 'assets\\' to 'site\\'")
-        
         src = os.path.join(FOLDERS["assets"], name)
         copy_with_dirs(src, name)
 
@@ -202,26 +207,18 @@ def generate(incremental: bool=True):
 
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
         meta = json.load(f)
-    
+
     print("\nDetecting changed files...")
 
-    if incremental:
-        changes = get_changes(meta)
+    changes = get_changes(meta, not incremental)
 
-        if len(changes["assets"][0]) == 0 and len(changes["assets"][1]) == 0 \
-           and len(changes["templates"][0]) == 0 and len(changes["templates"][1]) == 0 \
-           and len(changes["posts"][0]) == 0 and len(changes["posts"][1]) == 0:
-            print("No changes!")
-            return
-    else:
-        empty = {
-                    "templates": {},
-                    "assets": {},
-                    "posts": {},
-                }
-        changes = get_changes(empty)
+    if incremental and len(changes["assets"][0]) == 0 and len(changes["assets"][1]) == 0 \
+        and len(changes["templates"][0]) == 0 and len(changes["templates"][1]) == 0 \
+        and len(changes["posts"][0]) == 0 and len(changes["posts"][1]) == 0:
+        print("No changes!")
+        return
 
-    process_folder_changes(meta["templates"], changes["templates"], templates_mod_handler, 
+    process_folder_changes(meta["templates"], changes["templates"], templates_mod_handler,
                            del_handler, incremental)
     process_folder_changes(meta["assets"], changes["assets"], static_mod_handler,
                            del_handler, incremental)
@@ -231,7 +228,7 @@ def generate(incremental: bool=True):
 
     print("Done!")
 
-    
+
 def run():
     """
     Run a simple development server.
@@ -242,7 +239,7 @@ def run():
     def static(path: str) -> str:
         return path
 
-    host_name = "localhost"
+    host_name = "192.168.1.68"
     server_port = 8080
 
     env = Environment(
@@ -256,8 +253,11 @@ def run():
             requested_no_ext = os.path.splitext(requested)[0]
 
             if os.path.isfile(os.path.join(FOLDERS["assets"], requested)):
+                no_cache = ["js", "style"]
+                dir, _ = os.path.split(requested)
                 self.send_response(200)
-                self.send_header('Cache-Control', 'public, max-age=15552000')
+                if dir not in no_cache:
+                    self.send_header('Cache-Control', 'public, max-age=15552000')
                 self.end_headers()
                 self.wfile.write(open(os.path.join(FOLDERS["assets"], requested),'rb').read())
             elif os.path.isfile(os.path.join(FOLDERS["posts"], requested_no_ext + ".md")):
@@ -281,17 +281,15 @@ def run():
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
-
-    server.server_close()
-    print("Server stopped.")
+        server.server_close()
+        print("Server stopped.")
 
 
 def diff():
     """
     Displays what has changed since last generation of site.
     """
-    def mod_handler(name: str): 
+    def mod_handler(name: str):
         modifications.append(f"{folder}\\{name}")
 
     def del_handler(name: str):
@@ -299,11 +297,11 @@ def diff():
 
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
         meta = json.load(f)
-    
+
     changes = get_changes(meta)
     modifications = []
     deletions = []
-    
+
     for (folder, files) in changes.items():
         process_folder_changes(meta, files, mod_handler, del_handler)
 
@@ -326,15 +324,14 @@ def main():
        create()
 
     elif cmd == "generate":
-        generate() 
+        generate()
 
     elif cmd == "run":
-        run() 
-    
+        run()
+
     elif cmd == "diff":
         diff()
 
 
 if __name__ == "__main__":
     main()
-    print()
