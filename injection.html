@@ -1,0 +1,18 @@
+<script type="text/javascript">
+    let pathname = window.location.pathname;
+    let pathname_no_ext = pathname.split(/\.[0-9a-z]+$/i)[0].slice(1);
+
+    async function startShowingMessage(){
+        const response = await fetch('/refresh',
+                                    {method: "POST"});
+        const text = await response.json();
+        const ext = text.refresh.match(/\.[1-9a-z]+$/i);
+        if(ext || text.refresh === pathname_no_ext)
+        {
+            window.location.reload();
+        }
+    }
+
+   setInterval(startShowingMessage, 200);
+
+</script>
