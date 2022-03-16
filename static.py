@@ -376,7 +376,7 @@ def run() -> None:
                 self.modified = modified_no_ext
             print(self.modified)
 
-    event_handler = DevServerEventHandler(1)
+    event_handler = DevServerEventHandler()
     observer = Observer()
     observer.schedule(event_handler, BASE_DIR, recursive=True)
     observer.start()
