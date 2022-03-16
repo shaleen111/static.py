@@ -2,14 +2,17 @@
 
 import argparse
 import hashlib
-from http.server import HTTPServer
 import json
+from tkinter import W
 import mistletoe
 import os
 import sys
 
 from shutil import copy
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from mistletoe.html_renderer import HTMLRenderer
+from mistletoe.latex_renderer import LaTeXRenderer
 from typing import Callable, Dict, Optional, Set, Tuple
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -105,7 +108,7 @@ def get_changes(meta: Dict, force_recompile: bool = False) -> Dict:
         def populate_changes(path_: str=FOLDERS[name], dir_chain: str="") -> None:
             for file in os.scandir(path_):
                 if file.is_dir():
-                    populate_changes(file.path, file.name)
+                    populate_changes(file.path, os.path.join(dir_chain, file.name))
 
                 elif file.name.endswith(ext):
                     name = os.path.join(dir_chain, file.name)
@@ -171,17 +174,66 @@ def assets_templates(path: str) -> str:
 def assets_posts(path: str) -> str:
     return os.path.join('..', path).replace('\\', '/')
 
+class MathJaxRenderer(HTMLRenderer, LaTeXRenderer):
+    """
+    MRO will first look for render functions under HTMLRenderer,
+    then LaTeXRenderer.
+    """
+    mathjax_src = ("<script> MathJax = { tex: { inlineMath: [[\'$', '$']], processEscapes: true } };</script>"
+                   '<script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script> '
+                   '<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>\n')
+
+    def render_math(self, token):
+        """
+        Ensure Math tokens are all enclosed in two dollar signs.
+        """
+        if token.content.startswith('$') or token.content.startswith('$$'):
+            return self.render_raw_text(token)
+        return '${}$'.format(self.render_raw_text(token))
+
+    def render_document(self, token):
+        """
+        Append CDN link for MathJax to the end of <body>.
+        """
+        return super().render_document(token) + self.mathjax_src
+
+
 def generate(incremental: bool=True) -> None:
     """
     Genereate files for the site.
     """
-    def copy_with_dirs(src: str, name: str) -> None:
-        dest = os.path.join(FOLDERS["site"], os.path.split(name)[0])
+    def make_dirs_for_file(dest_pathname: str) -> str:
+        dest = os.path.join(FOLDERS["site"], dest_pathname)
+        os.makedirs(os.path.split(dest)[0], exist_ok=True)
+        return dest
 
-        os.makedirs(os.path.split(src)[0], exist_ok=True)
-        os.makedirs(dest, exist_ok=True)
+    def assets_mod_handler(name: str) -> None:
+        if name in meta["no_output"]["assets"]:
+            return
 
+        print(f"Copying '{name}' from 'assets\\' to 'site\\'")
+        src = os.path.join(FOLDERS["assets"], name)
+        dest = make_dirs_for_file(name)
         copy(src, dest)
+
+    def posts_mod_handler(name: str) -> None:
+        if name in meta["no_output"]["templates"]:
+            return
+
+        print(f"Generating post 'posts\\{name}'...")
+
+        src = os.path.join(FOLDERS["posts"], name)
+        dest_pathname = os.path.join("posts", os.path.splitext(name)[0] + ".html")
+
+        with open(src) as post:
+            rendered_md = mistletoe.markdown(post, MathJaxRenderer)
+        template = env.get_template(meta["base"]["posts"].replace('\\', '/'))
+        template.globals.update(assets=assets_posts)
+        output = template.render(rendered_md = rendered_md)
+
+        dest = make_dirs_for_file(dest_pathname)
+        with open(dest, 'w') as f:
+            f.write(output)
 
     def templates_mod_handler(name: str) -> None:
         if name in meta["no_output"]["templates"]:
@@ -192,10 +244,8 @@ def generate(incremental: bool=True) -> None:
         template.globals.update(assets=assets_templates)
         output = template.render()
 
-        src = os.path.join(FOLDERS["templates"], name)
-        copy_with_dirs(src, name)
-
-        with open(os.path.join(FOLDERS["site"], name), 'w') as f:
+        dest = make_dirs_for_file(name)
+        with open(dest, 'w') as f:
             f.write(output)
 
     def del_handler(name: str) -> None:
@@ -211,13 +261,8 @@ def generate(incremental: bool=True) -> None:
                 print(f"Deleting empty directory 'site\\{dir}'...")
                 os.rmdir(dir_path)
 
-    def static_mod_handler(name: str) -> None:
-        if name in meta["no_output"]["assets"]:
-            return
-
-        print(f"Copying '{name}' from 'assets\\' to 'site\\'")
-        src = os.path.join(FOLDERS["assets"], name)
-        copy_with_dirs(src, name)
+    def posts_del_handler(name: str) -> None:
+        del_handler(os.path.join("posts", name))
 
 
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
@@ -239,8 +284,11 @@ def generate(incremental: bool=True) -> None:
     process_folder_changes(meta["templates"], changes["templates"], templates_mod_handler,
                            del_handler, incremental)
 
-    process_folder_changes(meta["assets"], changes["assets"], static_mod_handler,
+    process_folder_changes(meta["assets"], changes["assets"], assets_mod_handler,
                            del_handler, incremental)
+    process_folder_changes(meta["posts"], changes["posts"], posts_mod_handler,
+                           posts_del_handler, incremental)
+    # process_folder_changes()
 
     with open('meta.json', 'w') as f:
         json.dump(meta, f, indent=4)
@@ -286,8 +334,6 @@ def run() -> None:
     Run a simple development server.
     """
 
-    from http.server import BaseHTTPRequestHandler
-
     host_name = "192.168.1.68"
     server_port = 8080
     script_location = os.path.dirname(os.path.realpath(__file__))
@@ -306,12 +352,11 @@ def run() -> None:
     class DevServer(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             requested = self.path[1:]
-
             requested_no_ext, ext = os.path.splitext(requested)
 
             if requested == "" and os.path.isfile(os.path.join(FOLDERS["templates"], "index.html")):
                 self.send_response(301)
-                self.send_header('Location','/index.html')
+                self.send_header('Location','/index')
                 self.end_headers()
 
             elif os.path.isfile(os.path.join(FOLDERS["assets"], requested)):
@@ -325,7 +370,7 @@ def run() -> None:
                     self.send_response(200)
                     self.end_headers()
                     with open(requested) as post:
-                        rendered_md = mistletoe.markdown(post)
+                        rendered_md = mistletoe.markdown(post, MathJaxRenderer)
                         template = env.get_template(meta["base"]["posts"].replace('\\', '/'))
                         template.globals.update(assets=assets_posts)
                         self.wfile.write(bytes(template.render(rendered_md=rendered_md) + injection, "utf-8"))
@@ -335,7 +380,7 @@ def run() -> None:
                     self.send_response(200)
                     self.end_headers()
                     template = env.get_template((requested).replace('\\', '/'))
-                    template.globals.update(assets=assets_posts)
+                    template.globals.update(assets=assets_templates)
                     self.wfile.write(bytes(template.render() + injection, "utf-8"))
 
                 else:
@@ -374,7 +419,6 @@ def run() -> None:
             modified_no_ext, ext = os.path.splitext(self.modified)
             if ext in [".html", ".md"]:
                 self.modified = modified_no_ext
-            print(self.modified)
 
     event_handler = DevServerEventHandler()
     observer = Observer()
