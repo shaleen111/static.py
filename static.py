@@ -2,16 +2,17 @@
 
 import argparse
 import hashlib
+from http.server import HTTPServer
 import json
-from re import template
 import mistletoe
 import os
 import sys
 
 from shutil import copy
-from itertools import zip_longest
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from typing import Callable, Dict, Optional, Set, Tuple
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
 """
 n commands:
@@ -41,6 +42,7 @@ def get_args() -> Tuple:
     """
     Returns what the user wants to do.
     """
+
     parser = argparse.ArgumentParser()
     parser.add_argument('command',
             choices=['create', 'generate', 'run', 'diff'])
@@ -53,6 +55,7 @@ def create() -> None:
     """
     Create folders to house the site.
     """
+
     print(f"Creating folders for site.")
     for folder in FOLDERS.values():
         try:
@@ -99,7 +102,7 @@ def get_changes(meta: Dict, force_recompile: bool = False) -> Dict:
         return False
 
     def folder_changes(name: str, ext: str="", _force_recompile: bool=False) -> Tuple[Dict, Set]:
-        def populate_changes(path_: str=FOLDERS[name], dir_chain: str=""):
+        def populate_changes(path_: str=FOLDERS[name], dir_chain: str="") -> None:
             for file in os.scandir(path_):
                 if file.is_dir():
                     populate_changes(file.path, file.name)
@@ -161,11 +164,18 @@ def process_folder_changes(past: Dict, changes: Tuple,
         del_handler(deleted_file)
 
 
-def generate(incremental: bool=True):
+def assets_templates(path: str) -> str:
+    return path
+
+
+def assets_posts(path: str) -> str:
+    return os.path.join('..', path).replace('\\', '/')
+
+def generate(incremental: bool=True) -> None:
     """
     Genereate files for the site.
     """
-    def copy_with_dirs(src: str, name: str):
+    def copy_with_dirs(src: str, name: str) -> None:
         dest = os.path.join(FOLDERS["site"], os.path.split(name)[0])
 
         os.makedirs(os.path.split(src)[0], exist_ok=True)
@@ -173,13 +183,13 @@ def generate(incremental: bool=True):
 
         copy(src, dest)
 
-    def templates_mod_handler(name: str):
+    def templates_mod_handler(name: str) -> None:
         if name in meta["no_output"]["templates"]:
             return
 
         print(f"Rendering 'site\\{name}'...")
         template = env.get_template(name.replace("\\", "/"))
-        template.globals.update({"static": static})
+        template.globals.update(assets=assets_templates)
         output = template.render()
 
         src = os.path.join(FOLDERS["templates"], name)
@@ -188,7 +198,7 @@ def generate(incremental: bool=True):
         with open(os.path.join(FOLDERS["site"], name), 'w') as f:
             f.write(output)
 
-    def del_handler(name: str):
+    def del_handler(name: str) -> None:
         file_path = os.path.join(FOLDERS["site"], name)
         if os.path.isfile(file_path):
             print(f"Deleting 'site\\{name}'...")
@@ -201,7 +211,7 @@ def generate(incremental: bool=True):
                 print(f"Deleting empty directory 'site\\{dir}'...")
                 os.rmdir(dir_path)
 
-    def static_mod_handler(name: str):
+    def static_mod_handler(name: str) -> None:
         if name in meta["no_output"]["assets"]:
             return
 
@@ -209,14 +219,11 @@ def generate(incremental: bool=True):
         src = os.path.join(FOLDERS["assets"], name)
         copy_with_dirs(src, name)
 
-    def static(path: str) -> str:
-        return path
-
 
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
         meta = json.load(f)
 
-    print("\nDetecting changed files...")
+    print("Detecting changed files...")
 
     changes = get_changes(meta, not incremental)
     if incremental and len(changes["assets"][0]) == 0 and len(changes["assets"][1]) == 0 \
@@ -241,75 +248,14 @@ def generate(incremental: bool=True):
     print("Done!")
 
 
-def run():
-    """
-    Run a simple development server.
-    """
-
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    def static(path: str) -> str:
-        return path
-
-    host_name = "192.168.1.68"
-    server_port = 8080
-
-    env = Environment(
-            loader=FileSystemLoader(searchpath=["templates"]),
-            autoescape=select_autoescape()
-        )
-
-    class DevServer(BaseHTTPRequestHandler):
-        def do_GET(self):
-            requested = self.path[1:]
-            requested_no_ext, ext = os.path.splitext(requested)
-
-            if os.path.isfile(os.path.join(FOLDERS["assets"], requested)):
-                no_cache = ["js", "style"]
-                dir, _ = os.path.split(requested)
-                self.send_response(200)
-                if dir not in no_cache:
-                    self.send_header('Cache-Control', 'public, max-age=15552000')
-                self.end_headers()
-                self.wfile.write(open(os.path.join(FOLDERS["assets"], requested),'rb').read())
-            elif ext in ['', '.html']:
-                if os.path.isfile(os.path.join(FOLDERS["posts"], requested_no_ext + ".md")):
-                    requested = requested_no_ext + ".md"
-                    self.send_response(200)
-                    self.end_headers()
-                    with open(os.path.join(FOLDERS["posts"], requested)) as post:
-                        rendered_md = mistletoe.markdown(post)
-                        self.wfile.write(bytes(rendered_md, "utf-8"))
-                elif os.path.isfile(os.path.join(FOLDERS["templates"], requested_no_ext + ".html")):
-                    requested = requested_no_ext + ".html"
-                    self.send_response(200)
-                    self.end_headers()
-                    template = env.get_template((requested).replace('\\', '/'))
-                    template.globals.update({'static': static})
-                    self.wfile.write(bytes(template.render(), "utf-8"))
-            else:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(bytes("<h1>404</h1>", "utf-8"))
-
-    server = HTTPServer((host_name, server_port), DevServer)
-    print("Server started http://%s:%s" % (host_name, server_port))
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        server.server_close()
-        print("Server stopped.")
-
-
-def diff():
+def diff() -> None:
     """
     Displays what has changed since last generation of site.
     """
-    def mod_handler(name: str):
+    def mod_handler(name: str) -> None:
         modifications.append(f"{folder}\\{name}")
 
-    def del_handler(name: str):
+    def del_handler(name: str) -> None:
         deletions.append(f"{folder}\\{name}")
 
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
@@ -322,7 +268,7 @@ def diff():
     for (folder, files) in changes.items():
         process_folder_changes(meta, files, mod_handler, del_handler)
 
-    print("\nChanges:", end="")
+    print("Changes:", end="")
     if len(modifications) == 0:
         print(f"{COLORS['cyan']} None!{COLORS['endc']}")
     else:
@@ -334,8 +280,123 @@ def diff():
     else:
         print(COLORS['red'] + '\n\t' + '\n\t'.join(deletions) + COLORS['endc'])
 
-def main():
+
+def run() -> None:
+    """
+    Run a simple development server.
+    """
+
+    from http.server import BaseHTTPRequestHandler
+
+    host_name = "192.168.1.68"
+    server_port = 8080
+    script_location = os.path.dirname(os.path.realpath(__file__))
+
+    env = Environment(
+            loader=FileSystemLoader(searchpath=["templates"]),
+            autoescape=select_autoescape()
+        )
+
+    with open(os.path.join(BASE_DIR, 'meta.json')) as f:
+        meta = json.load(f)
+
+    with open(os.path.join(script_location, "injection.html")) as inj:
+        injection = inj.read()
+
+    class DevServer(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requested = self.path[1:]
+
+            requested_no_ext, ext = os.path.splitext(requested)
+
+            if requested == "" and os.path.isfile(os.path.join(FOLDERS["templates"], "index.html")):
+                self.send_response(301)
+                self.send_header('Location','/index.html')
+                self.end_headers()
+
+            elif os.path.isfile(os.path.join(FOLDERS["assets"], requested)):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(open(os.path.join(FOLDERS["assets"], requested),'rb').read())
+
+            elif ext in ['', '.html'] and requested_no_ext != '':
+                if os.path.isfile(requested_no_ext + ".md"):
+                    requested = requested_no_ext + ".md"
+                    self.send_response(200)
+                    self.end_headers()
+                    with open(requested) as post:
+                        rendered_md = mistletoe.markdown(post)
+                        template = env.get_template(meta["base"]["posts"].replace('\\', '/'))
+                        template.globals.update(assets=assets_posts)
+                        self.wfile.write(bytes(template.render(rendered_md=rendered_md) + injection, "utf-8"))
+
+                elif os.path.isfile(os.path.join(FOLDERS["templates"], requested_no_ext + ".html")):
+                    requested = requested_no_ext + ".html"
+                    self.send_response(200)
+                    self.end_headers()
+                    template = env.get_template((requested).replace('\\', '/'))
+                    template.globals.update(assets=assets_posts)
+                    self.wfile.write(bytes(template.render() + injection, "utf-8"))
+
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(bytes("<h1>404</h1>", "utf-8"))
+
+            else:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(bytes("<h1>404</h1>", "utf-8"))
+
+        def do_POST(self):
+            if self.path == "/refresh":
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({ 'refresh': event_handler.modified }).encode(encoding='utf_8'))
+                if event_handler.modified:
+                    event_handler.modified = ""
+
+    class DevServerEventHandler(FileSystemEventHandler):
+        def __init__(self, tolerance: int) -> None:
+            super().__init__()
+            self.modified = ""
+
+        def on_modified(self, event):
+            if FOLDERS["templates"] in event.src_path:
+                start_path = FOLDERS["templates"]
+            elif FOLDERS["assets"] in event.src_path:
+                start_path = FOLDERS["assets"]
+            else:
+                start_path = BASE_DIR
+
+            self.modified = os.path.relpath(event.src_path, start_path).replace('\\', '/')
+            modified_no_ext, ext = os.path.splitext(self.modified)
+            if ext in [".html", ".md"]:
+                self.modified = modified_no_ext
+            print(self.modified)
+
+    event_handler = DevServerEventHandler(1)
+    observer = Observer()
+    observer.schedule(event_handler, BASE_DIR, recursive=True)
+    observer.start()
+
+    server = HTTPServer((host_name, server_port), DevServer)
+    print("Server started http://%s:%s" % (host_name, server_port))
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        observer.stop()
+        print("Server closed!")
+    observer.join()
+
+
+
+def main() -> None:
     cmd = get_args()
+
+    print()
 
     if cmd == "create":
        create()
