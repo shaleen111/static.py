@@ -358,7 +358,7 @@ def run() -> None:
                     event_handler.modified = ""
 
     class DevServerEventHandler(FileSystemEventHandler):
-        def __init__(self, tolerance: int) -> None:
+        def __init__(self) -> None:
             super().__init__()
             self.modified = ""
 
