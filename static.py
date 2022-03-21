@@ -3,16 +3,18 @@
 import argparse
 import hashlib
 import json
-from tkinter import W
-import mistletoe
 import os
 import sys
+import string
+import yaml
 
 from shutil import copy
+from string import punctuation
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from mistletoe.html_renderer import HTMLRenderer
-from mistletoe.latex_renderer import LaTeXRenderer
+from markdown_it import MarkdownIt
+from mdit_py_plugins.front_matter import front_matter_plugin
+from mdit_py_plugins.dollarmath import dollarmath_plugin
 from typing import Callable, Dict, Optional, Set, Tuple
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
@@ -39,6 +41,12 @@ FOLDERS = {
     "assets": os.path.join(BASE_DIR, "assets"),
     "site": os.path.join(BASE_DIR, "site"),
 }
+
+md = (
+    MarkdownIt()
+    .use(front_matter_plugin)
+    .use(dollarmath_plugin, double_inline=True)
+)
 
 
 def get_args() -> Tuple:
@@ -123,6 +131,7 @@ def get_changes(meta: Dict, force_recompile: bool = False) -> Dict:
                                         "mod_date": curr_mod_date,
                                         "hash": curr_hash,
                                     }
+
                     if not new_file:
                         past_set.remove(name)
 
@@ -167,6 +176,39 @@ def process_folder_changes(past: Dict, changes: Tuple,
         del_handler(deleted_file)
 
 
+def diff() -> None:
+    """
+    Displays what has changed since last generation of site.
+    """
+    def mod_handler(name: str) -> None:
+        modifications.append(f"{folder}\\{name}")
+
+    def del_handler(name: str) -> None:
+        deletions.append(f"{folder}\\{name}")
+
+    with open(os.path.join(BASE_DIR, 'meta.json')) as f:
+        meta = json.load(f)
+
+    changes = get_changes(meta)
+    modifications = []
+    deletions = []
+
+    for (folder, files) in changes.items():
+        process_folder_changes(meta, files, mod_handler, del_handler)
+
+    print("Changes:", end="")
+    if len(modifications) == 0:
+        print(f"{COLORS['cyan']} None!{COLORS['endc']}")
+    else:
+        print(COLORS['green'] + '\n\t' + '\n\t'.join(modifications) + COLORS['endc'])
+
+    print("\nDeletions:", end="")
+    if len(deletions) == 0:
+        print(f"{COLORS['cyan']} None!{COLORS['endc']}")
+    else:
+        print(COLORS['red'] + '\n\t' + '\n\t'.join(deletions) + COLORS['endc'])
+
+
 def assets_templates(path: str) -> str:
     return path
 
@@ -174,28 +216,33 @@ def assets_templates(path: str) -> str:
 def assets_posts(path: str) -> str:
     return os.path.join('..', path).replace('\\', '/')
 
-class MathJaxRenderer(HTMLRenderer, LaTeXRenderer):
-    """
-    MRO will first look for render functions under HTMLRenderer,
-    then LaTeXRenderer.
-    """
-    mathjax_src = ("<script> MathJax = { tex: { inlineMath: [[\'$', '$']], processEscapes: true } };</script>"
-                   '<script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script> '
-                   '<script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>\n')
 
-    def render_math(self, token):
-        """
-        Ensure Math tokens are all enclosed in two dollar signs.
-        """
-        if token.content.startswith('$') or token.content.startswith('$$'):
-            return self.render_raw_text(token)
-        return '${}$'.format(self.render_raw_text(token))
+def get_front_matter(tokens):
+    front_matter = {}
+    if tokens[0].type == "front_matter":
+        front_matter = yaml.safe_load(tokens[0].content)
+    return {**front_matter, **word_count(tokens)}
 
-    def render_document(self, token):
-        """
-        Append CDN link for MathJax to the end of <body>.
-        """
-        return super().render_document(token) + self.mathjax_src
+
+def word_count(tokens) -> Dict:
+    def count(text: str) -> int:
+        return sum([el.strip(string.punctuation).isalpha() for el in text.split()])
+
+    info: Dict = {}
+
+    words = 0
+    for token in tokens:
+        if token.type == "text":
+            words += count(token.content)
+        elif token.type == "inline":
+            for child in token.children or ():
+                if child.type == "text":
+                    words += count(child.content)
+
+
+    info["words"] = words
+    info["minutes"] = int(round(info["words"] / 200))
+    return info
 
 
 def generate(incremental: bool=True) -> None:
@@ -226,10 +273,13 @@ def generate(incremental: bool=True) -> None:
         dest_pathname = os.path.join("posts", os.path.splitext(name)[0] + ".html")
 
         with open(src) as post:
-            rendered_md = mistletoe.markdown(post, MathJaxRenderer)
+            post = f.read()
+        tokens = md.parse(post)
+        front_matter = get_front_matter(tokens)
+        rendered_md = md.render(post)
         template = env.get_template(meta["base"]["posts"].replace('\\', '/'))
         template.globals.update(assets=assets_posts)
-        output = template.render(rendered_md = rendered_md)
+        output = template.render(post=front_matter, rendered_md = rendered_md)
 
         dest = make_dirs_for_file(dest_pathname)
         with open(dest, 'w') as f:
@@ -296,47 +346,14 @@ def generate(incremental: bool=True) -> None:
     print("Done!")
 
 
-def diff() -> None:
-    """
-    Displays what has changed since last generation of site.
-    """
-    def mod_handler(name: str) -> None:
-        modifications.append(f"{folder}\\{name}")
-
-    def del_handler(name: str) -> None:
-        deletions.append(f"{folder}\\{name}")
-
-    with open(os.path.join(BASE_DIR, 'meta.json')) as f:
-        meta = json.load(f)
-
-    changes = get_changes(meta)
-    modifications = []
-    deletions = []
-
-    for (folder, files) in changes.items():
-        process_folder_changes(meta, files, mod_handler, del_handler)
-
-    print("Changes:", end="")
-    if len(modifications) == 0:
-        print(f"{COLORS['cyan']} None!{COLORS['endc']}")
-    else:
-        print(COLORS['green'] + '\n\t' + '\n\t'.join(modifications) + COLORS['endc'])
-
-    print("\nDeletions:", end="")
-    if len(deletions) == 0:
-        print(f"{COLORS['cyan']} None!{COLORS['endc']}")
-    else:
-        print(COLORS['red'] + '\n\t' + '\n\t'.join(deletions) + COLORS['endc'])
-
-
 def run() -> None:
     """
     Run a simple development server.
     """
 
-    host_name = "192.168.1.68"
-    server_port = 8080
-    script_location = os.path.dirname(os.path.realpath(__file__))
+    HOST_NAME = "192.168.1.68"
+    SERVER_PORT = 8080
+    SCRIPT_LOCATION = os.path.dirname(os.path.realpath(__file__))
 
     env = Environment(
             loader=FileSystemLoader(searchpath=["templates"]),
@@ -346,15 +363,33 @@ def run() -> None:
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
         meta = json.load(f)
 
-    with open(os.path.join(script_location, "injection.html")) as inj:
+    with open(os.path.join(SCRIPT_LOCATION, "injection.html")) as inj:
         injection = inj.read()
 
+    index_exists = os.path.isfile(os.path.join(FOLDERS["templates"], "index.html"))
+    not_found_exists = os.path.isfile(os.path.join(FOLDERS["templates"], "404.html"))
+
     class DevServer(BaseHTTPRequestHandler):
+        def write_template(self, template) -> None:
+            self.wfile.write(bytes(template.render() + injection, "utf-8"))
+
+        def send_404(self) -> None:
+            self.send_response(404)
+            self.end_headers()
+
+            if not_found_exists:
+                template = env.get_template("404.html")
+                template.globals.update(assets=assets_templates)
+                self.write_template(template)
+
+            else:
+                self.wfile.write(bytes("<h1>404</h1>", "utf-8"))
+
         def do_GET(self) -> None:
             requested = self.path[1:]
             requested_no_ext, ext = os.path.splitext(requested)
 
-            if requested == "" and os.path.isfile(os.path.join(FOLDERS["templates"], "index.html")):
+            if index_exists and requested == "":
                 self.send_response(301)
                 self.send_header('Location','/index')
                 self.end_headers()
@@ -369,11 +404,14 @@ def run() -> None:
                     requested = requested_no_ext + ".md"
                     self.send_response(200)
                     self.end_headers()
-                    with open(requested) as post:
-                        rendered_md = mistletoe.markdown(post, MathJaxRenderer)
-                        template = env.get_template(meta["base"]["posts"].replace('\\', '/'))
-                        template.globals.update(assets=assets_posts)
-                        self.wfile.write(bytes(template.render(rendered_md=rendered_md) + injection, "utf-8"))
+                    with open(requested) as f:
+                        post = f.read()
+                    tokens = md.parse(post)
+                    front_matter = get_front_matter(tokens)
+                    rendered_md = md.render(post)
+                    template = env.get_template(meta["base"]["posts"].replace('\\', '/'))
+                    template.globals.update(assets=assets_posts, post=front_matter, rendered_md=rendered_md)
+                    self.write_template(template)
 
                 elif os.path.isfile(os.path.join(FOLDERS["templates"], requested_no_ext + ".html")):
                     requested = requested_no_ext + ".html"
@@ -381,17 +419,13 @@ def run() -> None:
                     self.end_headers()
                     template = env.get_template((requested).replace('\\', '/'))
                     template.globals.update(assets=assets_templates)
-                    self.wfile.write(bytes(template.render() + injection, "utf-8"))
+                    self.write_template(template)
 
                 else:
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(bytes("<h1>404</h1>", "utf-8"))
+                    self.send_404()
 
             else:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(bytes("<h1>404</h1>", "utf-8"))
+                self.send_404()
 
         def do_POST(self):
             if self.path == "/refresh":
@@ -425,8 +459,8 @@ def run() -> None:
     observer.schedule(event_handler, BASE_DIR, recursive=True)
     observer.start()
 
-    server = HTTPServer((host_name, server_port), DevServer)
-    print("Server started http://%s:%s" % (host_name, server_port))
+    server = HTTPServer((HOST_NAME, SERVER_PORT), DevServer)
+    print("Server started http://%s:%s" % (HOST_NAME, SERVER_PORT))
 
     try:
         server.serve_forever()
@@ -434,7 +468,6 @@ def run() -> None:
         observer.stop()
         print("Server closed!")
     observer.join()
-
 
 
 def main() -> None:
