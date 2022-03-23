@@ -117,17 +117,15 @@ def create() -> None:
     print("Done!")
 
 
-def recursively_act_on_dir(action: Callable) -> Callable:
-    def inner(path: str, relpath: Optional[str]="") -> List:
-        agg_rets = dict()
-        for file in os.scandir(path):
-            if file.is_dir():
-                agg_rets.update(inner(path=file.path, relpath=os.path.join(relpath, file.name)))
-            else:
-                ret = action(file=file, relpath=relpath)
-                if ret:
-                    agg_rets[ret[0]] = ret[1]
-        return agg_rets
+def recursively_act_on_dir(action: Callable, pattern: Optional[str] = "") -> Callable:
+    def inner(pattern=pattern) -> None:
+        files = glob.iglob(pattern, recursive=True)
+        returns = dict()
+        for file in files:
+            ret = action(file)
+            if ret:
+                returns[ret[0]] = ret[1]
+        return returns
     return inner
 
 
@@ -139,43 +137,41 @@ def sanitize_path(path: str) -> str:
     return path
 
 
-def get_changes(history: Dict, meta: Dict, force_recompile: bool = False) -> Dict[str, FolderChanges]:
-    def file_changed(name: str, file_past: FileInfo) -> bool:
-        path = os.path.join(BASE_DIR, name)
-        if not os.path.isfile(path):
-            return False
+def build_dep_tree(meta: Dict):
+    ddeps = meta["deps"]
+    for (file, deps) in ddeps.items():
+        pass
 
-        if not file_past:
-            return True
+
+def get_changes(history: Dict, meta: Dict, force_recompile: bool = False) -> Dict[str, FolderChanges]:
+    def file_changes(path: str, file_past: FileInfo) -> bool:
+        if not os.path.isfile(path):
+            return {}
 
         curr_mod_date = os.path.getmtime(path)
-        if file_past["mod_date"] < curr_mod_date:
+        if file_past and file_past["mod_date"] < curr_mod_date:
             curr_hash = hashlib.md5(open(path, 'rb').read()).hexdigest()
-            if file_past["hash"] != curr_hash:
-                return True
+            if file_past and file_past["hash"] != curr_hash:
+                return {
+                    "mod_date": curr_mod_date,
+                    "hash": curr_hash
+                }
 
-        return False
+        return {}
 
     def folder_changes(name: str, ext: str="", _force_recompile: bool|Set[str] = False) -> FolderChanges:
         @recursively_act_on_dir
-        def populate_changes(file: os.DirEntry[str], relpath: str) -> None:
-            if not file.name.endswith(ext):
-                return
-            name = os.path.join(relpath, file.name)
+        def populate_changes(file: str) -> None:
+            file_name = os.path.relpath(file, name)
 
-            new_file = name not in past_set
-
-            curr_mod_date = file.stat().st_mtime
-            if new_file or past[name]["mod_date"] < curr_mod_date:
-                curr_hash = hashlib.md5(open(file.path, 'rb').read()).hexdigest()
-                if new_file or past[name]["hash"] != curr_hash:
-                    changes[name] = {
-                                "mod_date": curr_mod_date,
-                                "hash": curr_hash,
-                            }
+            new_file = file_name not in past_set
+            file_past = {} if new_file else past[file_name]
+            _file_changes = file_changes(file, file_past)
+            if _file_changes:
+                changes[file_name] = _file_changes
 
             if not new_file:
-                past_set.remove(name)
+                past_set.remove(file_name)
 
         if _force_recompile == True:
             past_set = set()
@@ -187,22 +183,21 @@ def get_changes(history: Dict, meta: Dict, force_recompile: bool = False) -> Dic
 
         changes = {}
 
-        populate_changes(FOLDERS[name])
+        populate_changes(f"{name}/**/*{ext}")
 
         return (changes, past_set)
 
     all_changes = {}
 
     data_changes = folder_changes("data", ".json")
-
     base_template = meta["base"]["templates"]
-    templates_force_recompile = force_recompile or file_changed(os.path.join(FOLDERS["templates"], base_template),
+    templates_force_recompile = force_recompile or file_changes(os.path.join(FOLDERS["templates"], base_template),
                                 history["templates"][base_template] if base_template in history["templates"] else {})
-    all_changes["templates"] = folder_changes("templates", ".html", templates_force_recompile)
+    all_changes["templates"] = folder_changes("templates", ".html", bool(templates_force_recompile))
 
     posts_template = meta["base"]["posts"]
     posts_force_recompile = templates_force_recompile or posts_template in all_changes["templates"][0]
-    all_changes["posts"] = folder_changes("posts", ".md", posts_force_recompile)
+    all_changes["posts"] = folder_changes("posts", ".md", bool(posts_force_recompile))
 
     all_changes["assets"] = folder_changes("assets")
 
