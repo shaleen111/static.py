@@ -1,6 +1,7 @@
 """A simple static site generator"""
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -9,14 +10,14 @@ import string
 import yaml
 
 from shutil import copy
-from string import punctuation
-from jinja2 import Environment, FileSystemLoader, select_autoescape
+from jinja2 import Environment, FileSystemLoader, Template, select_autoescape
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from markdown_it import MarkdownIt
+from markdown_it.token import Token
 from mdit_py_plugins.front_matter import front_matter_plugin
 from mdit_py_plugins.dollarmath import dollarmath_plugin
-from typing import Callable, Dict, Optional, Set, Tuple
-from watchdog.events import FileSystemEventHandler
+from typing import Callable, Dict, List, Optional, Set, Tuple
+from watchdog.events import FileSystemEventHandler, DirModifiedEvent, FileModifiedEvent
 from watchdog.observers import Observer
 
 """
@@ -40,7 +41,12 @@ FOLDERS = {
     "posts": os.path.join(BASE_DIR, "posts"),
     "assets": os.path.join(BASE_DIR, "assets"),
     "site": os.path.join(BASE_DIR, "site"),
+    "data": os.path.join(BASE_DIR, "data"),
 }
+
+FileInfo = Dict[str, str]
+FolderInfo = Dict[str, FileInfo]
+FolderChanges = Tuple[FolderInfo, Set[str]]
 
 md = (
     MarkdownIt()
@@ -48,10 +54,15 @@ md = (
     .use(dollarmath_plugin, double_inline=True)
 )
 
+env = Environment(
+    loader=FileSystemLoader(searchpath=[FOLDERS["templates"]]),
+    autoescape=select_autoescape()
+)
 
-def get_args() -> Tuple:
+
+def get_args() -> str:
     """
-    Returns what the user wants to do.
+    Parses through and validates command line arguments.
     """
 
     parser = argparse.ArgumentParser()
@@ -64,7 +75,15 @@ def get_args() -> Tuple:
 
 def create() -> None:
     """
-    Create folders to house the site.
+    Create directory structure for the site:
+    ./
+        -> assets/
+        -> data/
+        -> templates/
+        -> posts/
+        -> site/
+        -> history.json
+        -> meta.json
     """
 
     print(f"Creating folders for site.")
@@ -89,15 +108,40 @@ def create() -> None:
                 "posts": [],
                 "assets": [],
     }
-    meta = {"base": base_templates, "no_output": no_output,
-            "templates": {}, "posts": {}, "assets": {}}
+    meta = {"base": base_templates, "no_output": no_output}
+    history = {"assets": {}, "data": {}, "templates": {}, "posts": {}}
     with open('meta.json', 'w') as f:
         json.dump(meta, f, indent=4)
+    with open("history.json", 'w') as f:
+        json.dump(history, f, indent=4)
     print("Done!")
 
 
-def get_changes(meta: Dict, force_recompile: bool = False) -> Dict:
-    def file_changed(path: str, file_past: Dict) -> bool | Dict:
+def recursively_act_on_dir(action: Callable) -> Callable:
+    def inner(path: str, relpath: Optional[str]="") -> List:
+        agg_rets = dict()
+        for file in os.scandir(path):
+            if file.is_dir():
+                agg_rets.update(inner(path=file.path, relpath=os.path.join(relpath, file.name)))
+            else:
+                ret = action(file=file, relpath=relpath)
+                if ret:
+                    agg_rets[ret[0]] = ret[1]
+        return agg_rets
+    return inner
+
+
+def sanitize_path(path: str) -> str:
+    first_char = path[0]
+    while first_char in ['\\', '/', '.']:
+        path = path[1:]
+        first_char = path[0]
+    return path
+
+
+def get_changes(history: Dict, meta: Dict, force_recompile: bool = False) -> Dict[str, FolderChanges]:
+    def file_changed(name: str, file_past: FileInfo) -> bool:
+        path = os.path.join(BASE_DIR, name)
         if not os.path.isfile(path):
             return False
 
@@ -112,45 +156,48 @@ def get_changes(meta: Dict, force_recompile: bool = False) -> Dict:
 
         return False
 
-    def folder_changes(name: str, ext: str="", _force_recompile: bool=False) -> Tuple[Dict, Set]:
-        def populate_changes(path_: str=FOLDERS[name], dir_chain: str="") -> None:
-            for file in os.scandir(path_):
-                if file.is_dir():
-                    populate_changes(file.path, os.path.join(dir_chain, file.name))
+    def folder_changes(name: str, ext: str="", _force_recompile: bool|Set[str] = False) -> FolderChanges:
+        @recursively_act_on_dir
+        def populate_changes(file: os.DirEntry[str], relpath: str) -> None:
+            if not file.name.endswith(ext):
+                return
+            name = os.path.join(relpath, file.name)
 
-                elif file.name.endswith(ext):
-                    name = os.path.join(dir_chain, file.name)
+            new_file = name not in past_set
 
-                    new_file = name not in past_set
+            curr_mod_date = file.stat().st_mtime
+            if new_file or past[name]["mod_date"] < curr_mod_date:
+                curr_hash = hashlib.md5(open(file.path, 'rb').read()).hexdigest()
+                if new_file or past[name]["hash"] != curr_hash:
+                    changes[name] = {
+                                "mod_date": curr_mod_date,
+                                "hash": curr_hash,
+                            }
 
-                    curr_mod_date = file.stat().st_mtime
-                    if new_file or past[name]["mod_date"] < curr_mod_date:
-                        curr_hash = hashlib.md5(open(file.path, 'rb').read()).hexdigest()
-                        if new_file or past[name]["hash"] != curr_hash:
-                            changes[name] = {
-                                        "mod_date": curr_mod_date,
-                                        "hash": curr_hash,
-                                    }
+            if not new_file:
+                past_set.remove(name)
 
-                    if not new_file:
-                        past_set.remove(name)
-
-        if _force_recompile:
+        if _force_recompile == True:
             past_set = set()
         else:
-            past = meta[name]
-            past_set = set(past.keys())
+            if _force_recompile == False:
+                _force_recompile = set()
+            past = history[name]
+            past_set = set(past.keys()) - _force_recompile
+
         changes = {}
 
-        populate_changes()
+        populate_changes(FOLDERS[name])
 
         return (changes, past_set)
 
     all_changes = {}
 
+    data_changes = folder_changes("data", ".json")
+
     base_template = meta["base"]["templates"]
     templates_force_recompile = force_recompile or file_changed(os.path.join(FOLDERS["templates"], base_template),
-                                meta["templates"][base_template] if base_template in meta["templates"] else {})
+                                history["templates"][base_template] if base_template in history["templates"] else {})
     all_changes["templates"] = folder_changes("templates", ".html", templates_force_recompile)
 
     posts_template = meta["base"]["posts"]
@@ -159,20 +206,21 @@ def get_changes(meta: Dict, force_recompile: bool = False) -> Dict:
 
     all_changes["assets"] = folder_changes("assets")
 
+    all_changes["data"] = data_changes
+
     return all_changes
 
 
-def process_folder_changes(past: Dict, changes: Tuple,
-        mod_handler: Callable[[str], None], del_handler: Callable[[str], None],
-        save_changes: Optional[bool]=None,) -> None:
+def process_folder_changes(changes: FolderChanges, mod_handler: Callable[[str], None],
+    del_handler: Callable[[str], None], history: Optional[Dict[str, FolderInfo]]=None) -> None:
     for changed_file in changes[0].items():
         (name, metadata) = changed_file
-        if save_changes:
-            past[name] = metadata
+        if history:
+            history[name] = metadata
         mod_handler(name)
     for deleted_file in changes[1]:
-        if save_changes:
-            past.pop(deleted_file)
+        if history:
+            history.pop(deleted_file)
         del_handler(deleted_file)
 
 
@@ -186,15 +234,18 @@ def diff() -> None:
     def del_handler(name: str) -> None:
         deletions.append(f"{folder}\\{name}")
 
+    with open(os.path.join(BASE_DIR, 'history.json')) as f:
+        history = json.load(f)
+
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
         meta = json.load(f)
 
-    changes = get_changes(meta)
+    changes = get_changes(history, meta)
     modifications = []
     deletions = []
 
     for (folder, files) in changes.items():
-        process_folder_changes(meta, files, mod_handler, del_handler)
+        process_folder_changes(files, mod_handler, del_handler)
 
     print("Changes:", end="")
     if len(modifications) == 0:
@@ -209,28 +260,30 @@ def diff() -> None:
         print(COLORS['red'] + '\n\t' + '\n\t'.join(deletions) + COLORS['endc'])
 
 
-def assets_templates(path: str) -> str:
-    return path
+@recursively_act_on_dir
+def get_all_front_matter(file: os.DirEntry[str], relpath: str) -> Dict[str, Dict]:
+    if not file.name.endswith(".md"):
+        return
+    with open(file.path) as f:
+        post = f.read()
+    tokens = md.parse(post)
+    return (os.path.join(relpath, file.name), get_front_matter(tokens))
 
 
-def assets_posts(path: str) -> str:
-    return os.path.join('..', path).replace('\\', '/')
-
-
-def get_front_matter(tokens):
+def get_front_matter(tokens: List[Token]) -> Dict:
     front_matter = {}
     if tokens[0].type == "front_matter":
         front_matter = yaml.safe_load(tokens[0].content)
     return {**front_matter, **word_count(tokens)}
 
 
-def word_count(tokens) -> Dict:
+def word_count(tokens: List[Token]) -> Dict[str, int]:
     def count(text: str) -> int:
         return sum([el.strip(string.punctuation).isalpha() for el in text.split()])
 
     info: Dict = {}
 
-    words = 0
+    words: int = 0
     for token in tokens:
         if token.type == "text":
             words += count(token.content)
@@ -249,6 +302,7 @@ def generate(incremental: bool=True) -> None:
     """
     Genereate files for the site.
     """
+
     def make_dirs_for_file(dest_pathname: str) -> str:
         dest = os.path.join(FOLDERS["site"], dest_pathname)
         os.makedirs(os.path.split(dest)[0], exist_ok=True)
@@ -272,13 +326,12 @@ def generate(incremental: bool=True) -> None:
         src = os.path.join(FOLDERS["posts"], name)
         dest_pathname = os.path.join("posts", os.path.splitext(name)[0] + ".html")
 
-        with open(src) as post:
+        with open(src) as f:
             post = f.read()
         tokens = md.parse(post)
         front_matter = get_front_matter(tokens)
         rendered_md = md.render(post)
         template = env.get_template(meta["base"]["posts"].replace('\\', '/'))
-        template.globals.update(assets=assets_posts)
         output = template.render(post=front_matter, rendered_md = rendered_md)
 
         dest = make_dirs_for_file(dest_pathname)
@@ -291,7 +344,6 @@ def generate(incremental: bool=True) -> None:
 
         print(f"Rendering 'site\\{name}'...")
         template = env.get_template(name.replace("\\", "/"))
-        template.globals.update(assets=assets_templates)
         output = template.render()
 
         dest = make_dirs_for_file(name)
@@ -312,36 +364,46 @@ def generate(incremental: bool=True) -> None:
                 os.rmdir(dir_path)
 
     def posts_del_handler(name: str) -> None:
-        del_handler(os.path.join("posts", name))
+        del_post = os.path.join("posts", name)
+        del_post = os.path.splitext(del_post)[0] + ".html"
+        del_handler(del_post)
 
+    def data_handler(name: str) -> None:
+        print(f"Updating metadata for 'data\\{name}'...")
+
+
+    with open(os.path.join(BASE_DIR, 'history.json')) as f:
+        history = json.load(f)
 
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
         meta = json.load(f)
 
     print("Detecting changed files...")
 
-    changes = get_changes(meta, not incremental)
-    if incremental and len(changes["assets"][0]) == 0 and len(changes["assets"][1]) == 0 \
-        and len(changes["templates"][0]) == 0 and len(changes["templates"][1]) == 0 \
-        and len(changes["posts"][0]) == 0 and len(changes["posts"][1]) == 0:
+    no_changes = incremental
+    changes = get_changes(history, meta, not incremental)
+
+    if no_changes:
+        for folder in ["assets", "data", "templates", "posts"]:
+            if len(changes[folder][0]) + len(changes[folder][1]) > 0:
+                no_changes = False
+                break
+    if no_changes:
         print("No changes!")
         return
 
-    env = Environment(
-            loader=FileSystemLoader(searchpath=["templates"]),
-            autoescape=select_autoescape()
-        )
-    process_folder_changes(meta["templates"], changes["templates"], templates_mod_handler,
-                           del_handler, incremental)
+    send_history = lambda x: history[x] if incremental else None
+    process_folder_changes(changes["templates"], templates_mod_handler, del_handler,
+                           send_history("templates"))
+    process_folder_changes(changes["assets"], assets_mod_handler, del_handler,
+                           send_history("assets"))
+    process_folder_changes(changes["posts"], posts_mod_handler, posts_del_handler,
+                           send_history("posts"))
+    process_folder_changes(changes["data"], data_handler, data_handler,
+                           send_history("data"))
 
-    process_folder_changes(meta["assets"], changes["assets"], assets_mod_handler,
-                           del_handler, incremental)
-    process_folder_changes(meta["posts"], changes["posts"], posts_mod_handler,
-                           posts_del_handler, incremental)
-    # process_folder_changes()
-
-    with open('meta.json', 'w') as f:
-        json.dump(meta, f, indent=4)
+    with open('history.json', 'w') as f:
+        json.dump(history, f, indent=4)
 
     print("Done!")
 
@@ -355,11 +417,6 @@ def run() -> None:
     SERVER_PORT = 8080
     SCRIPT_LOCATION = os.path.dirname(os.path.realpath(__file__))
 
-    env = Environment(
-            loader=FileSystemLoader(searchpath=["templates"]),
-            autoescape=select_autoescape()
-        )
-
     with open(os.path.join(BASE_DIR, 'meta.json')) as f:
         meta = json.load(f)
 
@@ -370,7 +427,7 @@ def run() -> None:
     not_found_exists = os.path.isfile(os.path.join(FOLDERS["templates"], "404.html"))
 
     class DevServer(BaseHTTPRequestHandler):
-        def write_template(self, template) -> None:
+        def write_template(self, template: Template) -> None:
             self.wfile.write(bytes(template.render() + injection, "utf-8"))
 
         def send_404(self) -> None:
@@ -379,7 +436,7 @@ def run() -> None:
 
             if not_found_exists:
                 template = env.get_template("404.html")
-                template.globals.update(assets=assets_templates)
+                template.globals.update()
                 self.write_template(template)
 
             else:
@@ -410,7 +467,7 @@ def run() -> None:
                     front_matter = get_front_matter(tokens)
                     rendered_md = md.render(post)
                     template = env.get_template(meta["base"]["posts"].replace('\\', '/'))
-                    template.globals.update(assets=assets_posts, post=front_matter, rendered_md=rendered_md)
+                    template.globals.update(post=front_matter, rendered_md=rendered_md)
                     self.write_template(template)
 
                 elif os.path.isfile(os.path.join(FOLDERS["templates"], requested_no_ext + ".html")):
@@ -418,7 +475,6 @@ def run() -> None:
                     self.send_response(200)
                     self.end_headers()
                     template = env.get_template((requested).replace('\\', '/'))
-                    template.globals.update(assets=assets_templates)
                     self.write_template(template)
 
                 else:
@@ -441,7 +497,7 @@ def run() -> None:
             super().__init__()
             self.modified = ""
 
-        def on_modified(self, event):
+        def on_modified(self, event: DirModifiedEvent | FileModifiedEvent) -> None:
             if FOLDERS["templates"] in event.src_path:
                 start_path = FOLDERS["templates"]
             elif FOLDERS["assets"] in event.src_path:
@@ -454,6 +510,7 @@ def run() -> None:
             if ext in [".html", ".md"]:
                 self.modified = modified_no_ext
 
+    print(get_all_front_matter(FOLDERS["posts"]))
     event_handler = DevServerEventHandler()
     observer = Observer()
     observer.schedule(event_handler, BASE_DIR, recursive=True)
