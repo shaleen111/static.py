@@ -17,7 +17,8 @@ from markdown_it.token import Token
 from mdit_py_plugins.front_matter import front_matter_plugin
 from mdit_py_plugins.dollarmath import dollarmath_plugin
 from typing import Callable, Dict, List, Optional, Set, Tuple
-from watchdog.events import FileSystemEventHandler, DirModifiedEvent, FileModifiedEvent
+from watchdog.events import FileSystemEventHandler, DirModifiedEvent, \
+    FileModifiedEvent
 from watchdog.observers import Observer
 
 """
@@ -67,8 +68,7 @@ def get_args() -> str:
 
     parser = argparse.ArgumentParser()
     parser.add_argument('command',
-            choices=['create', 'generate', 'run', 'diff'])
-
+                        choices=['create', 'generate', 'run', 'diff'])
     arg = parser.parse_args()
     return arg.command
 
@@ -86,7 +86,7 @@ def create() -> None:
         -> meta.json
     """
 
-    print(f"Creating folders for site.")
+    print("Creating folders for site.")
     for folder in FOLDERS.values():
         try:
             os.mkdir(folder)
@@ -117,41 +117,56 @@ def create() -> None:
     print("Done!")
 
 
-def recursively_act_on_dir(action: Callable, pattern: Optional[str] = "") -> Callable:
-    def inner(pattern=pattern) -> None:
-        files = glob.iglob(pattern, recursive=True)
-        returns = dict()
-        for file in files:
-            ret = action(file)
-            if ret:
-                returns[ret[0]] = ret[1]
-        return returns
-    return inner
+def recursively_act_on_dir(pattern: str) -> Callable:
+    def decorator(action: Callable) -> Callable:
+        def inner() -> None:
+            files = glob.iglob(pattern, recursive=True)
+            returns = dict()
+            for file in files:
+                ret = action(file)
+                if ret:
+                    returns[ret[0]] = ret[1]
+            return returns
+        return inner
+    return decorator
 
 
-def sanitize_path(path: str) -> str:
-    first_char = path[0]
-    while first_char in ['\\', '/', '.']:
+def path_toss(path: str) -> str:
+    tossed = ""
+    c = path[0]
+    while c not in ['\\', '/']:
         path = path[1:]
-        first_char = path[0]
-    return path
+        tossed += c
+        c = path[0]
+    return (tossed, path[1:])
 
 
 def build_dep_tree(meta: Dict):
-    ddeps = meta["deps"]
-    for (file, deps) in ddeps.items():
-        pass
+    def get_files(pattern: str):
+        files = set(glob.iglob(pattern, recursive=True))
+        return files
+    prereqs = meta["deps"]
+    dependent = dict()
+    for (pattern, prereq) in prereqs.items():
+        for p in prereq:
+            p = p.replace('/', '\\')
+            if p in dependent:
+                dependent[p].update(get_files(pattern))
+            else:
+                dependent[p] = get_files(pattern)
+    return dependent
 
 
-def get_changes(history: Dict, meta: Dict, force_recompile: bool = False) -> Dict[str, FolderChanges]:
-    def file_changes(path: str, file_past: FileInfo) -> bool:
+def get_changes(history: Dict, meta: Dict, force_recompile: bool = False) \
+        -> Dict[str, FolderChanges]:
+    def _get_changes(path: str, file_past: FileInfo) -> bool:
         if not os.path.isfile(path):
             return {}
 
         curr_mod_date = os.path.getmtime(path)
-        if file_past and file_past["mod_date"] < curr_mod_date:
+        if not file_past or file_past["mod_date"] < curr_mod_date:
             curr_hash = hashlib.md5(open(path, 'rb').read()).hexdigest()
-            if file_past and file_past["hash"] != curr_hash:
+            if not file_past or file_past["hash"] != curr_hash:
                 return {
                     "mod_date": curr_mod_date,
                     "hash": curr_hash
@@ -159,55 +174,70 @@ def get_changes(history: Dict, meta: Dict, force_recompile: bool = False) -> Dic
 
         return {}
 
-    def folder_changes(name: str, ext: str="", _force_recompile: bool|Set[str] = False) -> FolderChanges:
-        @recursively_act_on_dir
+    def folder_changes(name: str, ext: Optional[str] = "",
+                       get_deps: Optional[Callable] = None) -> FolderChanges:
+        @recursively_act_on_dir(f"{name}/**/*{ext}")
         def populate_changes(file: str) -> None:
             file_name = os.path.relpath(file, name)
-
             new_file = file_name not in past_set
-            file_past = {} if new_file else past[file_name]
-            _file_changes = file_changes(file, file_past)
-            if _file_changes:
-                changes[file_name] = _file_changes
-
             if not new_file:
                 past_set.remove(file_name)
+            if file in prereqs:
+                print(file, prereq_changed)
+                if file in prereq_changed:
+                    changes[file_name] = prereq_info[file]
+                    print(changes[file_name])
+                return
+            if file not in recompile or new_file:
+                file_past = {} if new_file or file in recompile \
+                   else past[file_name]
+                file_changes = _get_changes(file, file_past)
+                if file_changes:
+                    changes[file_name] = file_changes
+            else:
+                changes[file_name] = history[name][file_name]
 
-        if _force_recompile == True:
+        if force_recompile:
             past_set = set()
         else:
-            if _force_recompile == False:
-                _force_recompile = set()
             past = history[name]
-            past_set = set(past.keys()) - _force_recompile
-
+            past_set = set(past.keys())
         changes = {}
 
-        populate_changes(f"{name}/**/*{ext}")
+        populate_changes()
 
         return (changes, past_set)
-
     all_changes = {}
 
-    data_changes = folder_changes("data", ".json")
-    base_template = meta["base"]["templates"]
-    templates_force_recompile = force_recompile or file_changes(os.path.join(FOLDERS["templates"], base_template),
-                                history["templates"][base_template] if base_template in history["templates"] else {})
-    all_changes["templates"] = folder_changes("templates", ".html", bool(templates_force_recompile))
+    dep_tree = build_dep_tree(meta)
+    recompile = set()
+    prereq_info = dict()
+    prereq_changed = set()
+    prereqs = dep_tree.keys()
+    for (prereq, dependents) in dep_tree.items():
+        folder, relpath = path_toss(prereq)
+        prereq_history = {} if prereq in recompile \
+            else history[folder][relpath]
+        prereq_changes = _get_changes(prereq, prereq_history)
+        if prereq_changes:
+            prereq_changed.add(prereq)
+            prereq_info[prereq] = prereq_changes
+            recompile.update(dependents)
 
-    posts_template = meta["base"]["posts"]
-    posts_force_recompile = templates_force_recompile or posts_template in all_changes["templates"][0]
-    all_changes["posts"] = folder_changes("posts", ".md", bool(posts_force_recompile))
-
+    all_changes["templates"] = folder_changes("templates", ".html")
+    all_changes["posts"] = folder_changes("posts", ".md")
     all_changes["assets"] = folder_changes("assets")
-
-    all_changes["data"] = data_changes
+    all_changes["data"] = folder_changes("data", ".json")
+    print(all_changes)
 
     return all_changes
 
 
-def process_folder_changes(changes: FolderChanges, mod_handler: Callable[[str], None],
-    del_handler: Callable[[str], None], history: Optional[Dict[str, FolderInfo]]=None) -> None:
+def process_folder_changes(changes: FolderChanges,
+                           mod_handler: Callable[[str], None],
+                           del_handler: Callable[[str], None],
+                           history: Optional[Dict[str, FolderInfo]] = None) \
+                           -> None:
     for changed_file in changes[0].items():
         (name, metadata) = changed_file
         if history:
@@ -255,7 +285,7 @@ def diff() -> None:
         print(COLORS['red'] + '\n\t' + '\n\t'.join(deletions) + COLORS['endc'])
 
 
-@recursively_act_on_dir
+@recursively_act_on_dir("posts/**/*.md")
 def get_all_front_matter(file: os.DirEntry[str], relpath: str) -> Dict[str, Dict]:
     if not file.name.endswith(".md"):
         return
@@ -286,7 +316,6 @@ def word_count(tokens: List[Token]) -> Dict[str, int]:
             for child in token.children or ():
                 if child.type == "text":
                     words += count(child.content)
-
 
     info["words"] = words
     info["minutes"] = int(round(info["words"] / 200))
@@ -326,7 +355,7 @@ def generate(incremental: bool=True) -> None:
         tokens = md.parse(post)
         front_matter = get_front_matter(tokens)
         rendered_md = md.render(post)
-        template = env.get_template(meta["base"]["posts"].replace('\\', '/'))
+        template = env.get_template(front_matter["template"].replace('\\', '/'))
         output = template.render(post=front_matter, rendered_md = rendered_md)
 
         dest = make_dirs_for_file(dest_pathname)
@@ -366,7 +395,6 @@ def generate(incremental: bool=True) -> None:
     def data_handler(name: str) -> None:
         print(f"Updating metadata for 'data\\{name}'...")
 
-
     with open(os.path.join(BASE_DIR, 'history.json')) as f:
         history = json.load(f)
 
@@ -396,7 +424,6 @@ def generate(incremental: bool=True) -> None:
                            send_history("posts"))
     process_folder_changes(changes["data"], data_handler, data_handler,
                            send_history("data"))
-
     with open('history.json', 'w') as f:
         json.dump(history, f, indent=4)
 
@@ -526,7 +553,6 @@ def main() -> None:
     cmd = get_args()
 
     print()
-
     if cmd == "create":
        create()
 
